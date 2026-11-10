@@ -9,6 +9,8 @@ import path from 'path';
 import fs from 'fs';
 import { DeviceCodeCredential } from '@azure/identity';
 import fetch from 'node-fetch';
+import { JSDOM } from 'jsdom';
+import { z } from 'zod';
 
 // Load environment variables
 dotenv.config();
@@ -514,6 +516,181 @@ server.tool(
     } catch (error) {
       console.error("Error searching pages:", error);
       throw new Error(`Failed to search pages: ${error.message}`);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// updatePage: replace, append to, or create a OneNote page.
+// Used by the "Master List ABC" artifact (host:onenote -> updatePage).
+// ---------------------------------------------------------------------------
+
+// Read the freshest saved token on every call, so re-running `npm run auth`
+// takes effect without restarting the server.
+function readFreshToken() {
+  try {
+    if (fs.existsSync(tokenFilePath)) {
+      const raw = fs.readFileSync(tokenFilePath, 'utf8');
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.token) return parsed.token;
+      } catch (e) {
+        if (raw.trim()) return raw.trim();
+      }
+    }
+  } catch (e) {
+    console.error('Error reading token file:', e.message);
+  }
+  return accessToken || process.env.GRAPH_ACCESS_TOKEN || null;
+}
+
+const GRAPH = 'https://graph.microsoft.com/v1.0';
+
+async function graphFetch(pathOrUrl, { method = 'GET', headers = {}, body } = {}) {
+  const token = readFreshToken();
+  if (!token) {
+    throw new Error('No access token found. Run `npm run auth` in the onenote-mcp folder, then try again.');
+  }
+  const url = pathOrUrl.startsWith('http') ? pathOrUrl : GRAPH + pathOrUrl;
+  const res = await fetch(url, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, ...headers },
+    body
+  });
+  if (res.status === 401) {
+    throw new Error('Microsoft rejected the saved sign-in (401, usually an expired token). Run `npm run auth` in the onenote-mcp folder, then try again.');
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Graph ${method} ${pathOrUrl.split('?')[0]} failed (${res.status}): ${text}`.slice(0, 900));
+  }
+  return res;
+}
+
+async function graphListAll(path, maxPages = 10) {
+  let url = path;
+  const out = [];
+  for (let i = 0; i < maxPages && url; i++) {
+    const res = await graphFetch(url);
+    const json = await res.json();
+    out.push(...(json.value || []));
+    url = json['@odata.nextLink'] || null;
+  }
+  return out;
+}
+
+function xmlEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function findSection(notebook, section) {
+  const sections = await graphListAll('/me/onenote/sections?$expand=parentNotebook&$top=100');
+  const wantSection = section.trim().toLowerCase();
+  const wantNotebook = notebook ? notebook.trim().toLowerCase() : null;
+  const matches = sections.filter(s =>
+    (s.displayName || '').trim().toLowerCase() === wantSection &&
+    (!wantNotebook || ((s.parentNotebook && s.parentNotebook.displayName) || '').trim().toLowerCase() === wantNotebook)
+  );
+  if (matches.length === 0) {
+    throw new Error(`No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`More than one section named "${section}" matched. Pass a notebook name to pick one.`);
+  }
+  return matches[0];
+}
+
+async function findPageByTitle(sectionId, title) {
+  const pages = await graphListAll(`/me/onenote/sections/${sectionId}/pages?$select=id,title,links&$top=100`);
+  const want = title.trim().toLowerCase();
+  const matches = pages.filter(p => (p.title || '').trim().toLowerCase() === want);
+  if (matches.length === 0) throw new Error(`No page titled "${title}" was found in that section.`);
+  if (matches.length > 1) throw new Error(`${matches.length} pages are titled "${title}" in that section. Rename or remove the duplicates first.`);
+  return matches[0];
+}
+
+async function createPageInSection(sectionId, title, bodyHtml) {
+  const doc = `<!DOCTYPE html><html><head><title>${xmlEscape(title)}</title></head><body>${bodyHtml}</body></html>`;
+  const res = await graphFetch(`/me/onenote/sections/${sectionId}/pages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/html' },
+    body: doc
+  });
+  return res.json();
+}
+
+server.tool(
+  "updatePage",
+  "Replace, append to, or create a OneNote page. mode 'replace' swaps the text on an existing page (after saving a backup copy of it), 'append' adds to the end of it, 'new' creates a separate dated page. html is a body fragment such as <p>..</p><ul><li>..</li></ul>.",
+  {
+    notebook: z.string().optional().describe("Notebook name, e.g. My 2024 Notebook"),
+    section: z.string().describe("Section name, e.g. Personal"),
+    title: z.string().describe("Title of the existing page, e.g. Master List"),
+    html: z.string().min(1).max(200000).describe("Body HTML fragment to write"),
+    mode: z.enum(["replace", "append", "new"]).default("replace"),
+    backup: z.boolean().default(true).describe("In replace mode, first save a text copy of the old page as a new page in the same section")
+  },
+  async ({ notebook, section, title, html, mode, backup }) => {
+    try {
+      const sec = await findSection(notebook, section);
+      const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
+      if (mode === 'new') {
+        const created = await createPageInSection(sec.id, `${title} (prioritized ${stamp.slice(0, 10)})`, html);
+        return { content: [{ type: "text", text: JSON.stringify({
+          ok: true, mode, pageId: created.id, pageTitle: created.title,
+          pageUrl: created.links && created.links.oneNoteWebUrl && created.links.oneNoteWebUrl.href
+        }) }] };
+      }
+
+      const page = await findPageByTitle(sec.id, title);
+      const pageUrl = page.links && page.links.oneNoteWebUrl && page.links.oneNoteWebUrl.href;
+
+      if (mode === 'append') {
+        await graphFetch(`/me/onenote/pages/${page.id}/content`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify([{ target: 'body', action: 'append', content: `<div>${html}</div>` }])
+        });
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, mode, pageId: page.id, pageUrl }) }] };
+      }
+
+      // mode === 'replace'
+      // 1. Backup: text copy of the current page (images and ink are not copied).
+      let backupTitle = null;
+      if (backup) {
+        const plain = await (await graphFetch(`/me/onenote/pages/${page.id}/content`)).text();
+        const oldBody = new JSDOM(plain).window.document.body.innerHTML;
+        backupTitle = `${title} (backup ${stamp})`;
+        await createPageInSection(sec.id, backupTitle, oldBody);
+      }
+
+      // 2. Find the page's outlines (top-level containers) via generated ids.
+      const withIds = await (await graphFetch(`/me/onenote/pages/${page.id}/content?includeIDs=true`)).text();
+      const doc = new JSDOM(withIds).window.document;
+      const outlines = Array.from(doc.body.children).filter(el => el.tagName === 'DIV' && el.id);
+
+      // 3. Replace the first outline with the new content and empty the rest.
+      const commands = [];
+      if (outlines.length === 0) {
+        commands.push({ target: 'body', action: 'append', content: `<div>${html}</div>` });
+      } else {
+        outlines.forEach((el, i) => {
+          commands.push({ target: el.id, action: 'replace', content: i === 0 ? `<div>${html}</div>` : '<div></div>' });
+        });
+      }
+      await graphFetch(`/me/onenote/pages/${page.id}/content`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(commands)
+      });
+
+      return { content: [{ type: "text", text: JSON.stringify({
+        ok: true, mode, pageId: page.id, pageUrl, backupTitle
+      }) }] };
+    } catch (error) {
+      console.error("Error updating page:", error);
+      throw new Error(`Failed to update page: ${error.message}`);
     }
   }
 );
