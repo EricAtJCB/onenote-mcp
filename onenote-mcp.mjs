@@ -583,7 +583,24 @@ function xmlEscape(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-async function findSection(notebook, section) {
+// A OneNote link contains the section GUID, e.g. section-id={07B54B34-...}.
+// Microsoft Graph spells the same section as "1-07b54b34-...".
+function normalizeSectionId(raw) {
+  const m = String(raw).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  return m ? `1-${m[0].toLowerCase()}` : String(raw).trim();
+}
+
+async function findSection(notebook, section, sectionId) {
+  if (sectionId) {
+    const id = normalizeSectionId(sectionId);
+    const res = await graphFetch(`/me/onenote/sections/${encodeURIComponent(id)}?$expand=parentNotebook`);
+    const sec = await res.json();
+    if (section && (sec.displayName || '').trim().toLowerCase() !== section.trim().toLowerCase()) {
+      throw new Error(`Section ${id} is named "${sec.displayName}", not "${section}".`);
+    }
+    return sec;
+  }
+  if (!section) throw new Error('Pass a section name or a sectionId.');
   const sections = await graphListAll('/me/onenote/sections?$expand=parentNotebook&$top=100');
   const wantSection = section.trim().toLowerCase();
   const wantNotebook = notebook ? notebook.trim().toLowerCase() : null;
@@ -592,7 +609,10 @@ async function findSection(notebook, section) {
     (!wantNotebook || ((s.parentNotebook && s.parentNotebook.displayName) || '').trim().toLowerCase() === wantNotebook)
   );
   if (matches.length === 0) {
-    throw new Error(`No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found.`);
+    const seen = sections.slice(0, 25)
+      .map(s => `${(s.parentNotebook && s.parentNotebook.displayName) || '?'} / ${s.displayName}`)
+      .join('; ');
+    throw new Error(`No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found. Sections Microsoft returned (${sections.length}): ${seen || 'none'}.`);
   }
   if (matches.length > 1) {
     throw new Error(`More than one section named "${section}" matched. Pass a notebook name to pick one.`);
@@ -624,15 +644,16 @@ server.tool(
   "Replace, append to, or create a OneNote page. mode 'replace' swaps the text on an existing page (after saving a backup copy of it), 'append' adds to the end of it, 'new' creates a separate dated page. html is a body fragment such as <p>..</p><ul><li>..</li></ul>.",
   {
     notebook: z.string().optional().describe("Notebook name, e.g. My 2024 Notebook"),
-    section: z.string().describe("Section name, e.g. Personal"),
+    section: z.string().optional().describe("Section name, e.g. Personal"),
+    sectionId: z.string().optional().describe("Section id or the section-id GUID from a OneNote link. Takes priority over names."),
     title: z.string().describe("Title of the existing page, e.g. Master List"),
     html: z.string().min(1).max(200000).describe("Body HTML fragment to write"),
     mode: z.enum(["replace", "append", "new"]).default("replace"),
     backup: z.boolean().default(true).describe("In replace mode, first save a text copy of the old page as a new page in the same section")
   },
-  async ({ notebook, section, title, html, mode, backup }) => {
+  async ({ notebook, section, sectionId, title, html, mode, backup }) => {
     try {
-      const sec = await findSection(notebook, section);
+      const sec = await findSection(notebook, section, sectionId);
       const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
       if (mode === 'new') {
