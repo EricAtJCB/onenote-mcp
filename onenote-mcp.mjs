@@ -637,6 +637,16 @@ function normalizeSectionId(raw) {
   return m ? `1-${m[0].toLowerCase()}` : String(raw).trim();
 }
 
+// OneNote Online links carry the page as wdpartid={DA28BEAB-C501-...} and the
+// section as wdsectionfileid={CDF895D4-...}. Graph spells the page
+// "1-<32 hex>!<section id>", where the section id is "1-<guid>".
+function normalizePageId(raw, sectionGraphId) {
+  const s = String(raw).trim();
+  if (/^1-[0-9a-f]{32}!1-/i.test(s)) return s;
+  const m = s.match(/[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}/i);
+  return m ? `1-${m[0].replace(/-/g, '').toLowerCase()}!${sectionGraphId}` : s;
+}
+
 function describeSections(sections, section) {
   const want = (section || '').trim().toLowerCase();
   const nbName = s => (s.parentNotebook && s.parentNotebook.displayName) || '?';
@@ -719,19 +729,24 @@ server.tool(
   {
     notebook: z.string().optional().describe("Notebook name, e.g. My 2024 Notebook"),
     section: z.string().optional().describe("Section name, e.g. Personal"),
-    sectionId: z.string().optional().describe("Section id or the section-id GUID from a OneNote link. Takes priority over names."),
+    sectionId: z.string().optional().describe("Section id, or the wdsectionfileid GUID from a OneNote Online link. Takes priority over names."),
+    pageId: z.string().optional().describe("Page id, or the wdpartid GUID from a OneNote Online link. Needs sectionId. Skips the page search; the page title must still match."),
     title: z.string().describe("Title of the existing page, e.g. Master List"),
     html: z.string().min(1).max(200000).describe("Body HTML fragment to write"),
     mode: z.enum(["replace", "append", "new"]).default("replace"),
     backup: z.boolean().default(true).describe("In replace mode, first save a text copy of the old page as a new page in the same section")
   },
-  async ({ notebook, section, sectionId, title, html, mode, backup }) => {
+  async ({ notebook, section, sectionId, pageId, title, html, mode, backup }) => {
     let backupSaved = null;
     callDeadline = Date.now() + CALL_BUDGET_MS;
     logLine(`updatePage start: mode=${mode} section=${sectionId || section} title=${title}`);
     try {
       currentStep = 'finding the section';
-      const sec = await findSection(notebook, section, sectionId);
+      // With both ids there is nothing to search for: skip the section lookup
+      // (it was taking 20 s) and let the page title check guard the write.
+      const sec = (pageId && sectionId)
+        ? { id: normalizeSectionId(sectionId), displayName: section }
+        : await findSection(notebook, section, sectionId);
       const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
       if (mode === 'new') {
@@ -743,7 +758,7 @@ server.tool(
       }
 
       currentStep = 'finding the page';
-      const page = await findPageByTitle(sec.id, title);
+      const page = pageId ? { id: normalizePageId(pageId, sec.id) } : await findPageByTitle(sec.id, title);
       const pageUrl = page.links && page.links.oneNoteWebUrl && page.links.oneNoteWebUrl.href;
 
       if (mode === 'append') {
@@ -756,23 +771,29 @@ server.tool(
       }
 
       // mode === 'replace'
-      // 1. Backup: text copy of the current page (images and ink are not copied).
-      let backupTitle = null;
-      if (backup) {
-        currentStep = 'reading the old page for the backup';
-        const plain = await (await graphFetch(`/me/onenote/pages/${page.id}/content`)).text();
-        const oldBody = new JSDOM(plain).window.document.body.innerHTML;
-        backupTitle = `${title} (backup ${stamp})`;
-        currentStep = 'saving the backup page';
-        await createPageInSection(sec.id, backupTitle, oldBody);
-        backupSaved = backupTitle;
-      }
-
-      // 2. Find the page's outlines (top-level containers) via generated ids.
-      currentStep = 'reading the page layout';
+      // 1. Read the page once, with element ids. This gives the outlines to
+      //    replace and the text for the backup.
+      currentStep = 'reading the page';
       const withIds = await (await graphFetch(`/me/onenote/pages/${page.id}/content?includeIDs=true`)).text();
       const doc = new JSDOM(withIds).window.document;
+      if (pageId && doc.title.trim().toLowerCase() !== title.trim().toLowerCase()) {
+        throw new Error(`That page is titled "${doc.title}", not "${title}". Nothing was changed.`);
+      }
       const outlines = Array.from(doc.body.children).filter(el => el.tagName === 'DIV' && el.id);
+
+      // 2. Backup: text copy of the current page (images and ink are not copied).
+      let backupTitle = null;
+      let backupUrl = null;
+      if (backup) {
+        const copy = doc.body.cloneNode(true);
+        copy.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+        backupTitle = `${title} (backup ${stamp} UTC)`;
+        currentStep = 'saving the backup page';
+        const made = await createPageInSection(sec.id, backupTitle, copy.innerHTML);
+        backupSaved = backupTitle;
+        backupUrl = (made.links && made.links.oneNoteWebUrl && made.links.oneNoteWebUrl.href) || null;
+        logLine(`backup page created: ${made.id} ${backupUrl || ''}`);
+      }
 
       // 3. Replace the first outline with the new content and empty the rest.
       const commands = [];
@@ -811,7 +832,7 @@ server.tool(
         if (applied) {
           logLine('PATCH timed out but the new text is on the page');
           return { content: [{ type: "text", text: JSON.stringify({
-            ok: true, mode, pageId: page.id, pageUrl, backupTitle,
+            ok: true, mode, pageId: page.id, pageUrl, backupTitle, backupUrl,
             note: 'Microsoft timed out, but the new list is on the Master List page.'
           }) }] };
         }
@@ -824,7 +845,7 @@ server.tool(
         return { content: [{ type: "text", text: JSON.stringify({
           ok: true, mode: 'new', fallback: true, pageId: created.id,
           pageUrl: (created.links && created.links.oneNoteWebUrl && created.links.oneNoteWebUrl.href) || pageUrl,
-          backupTitle,
+          backupTitle, backupUrl,
           note: applied === false
             ? `Microsoft would not replace the Master List page (it timed out), so the list was saved as a new page "${title} (prioritized ${stamp.slice(0, 10)})" and the original page is unchanged.`
             : `Microsoft timed out replacing the Master List page and I could not check it, so the list was also saved as a new page "${title} (prioritized ${stamp.slice(0, 10)})". Check whether Master List changed.`
@@ -833,7 +854,7 @@ server.tool(
 
       logLine(`updatePage done: replaced page ${page.id}, backup=${backupTitle}`);
       return { content: [{ type: "text", text: JSON.stringify({
-        ok: true, mode, pageId: page.id, pageUrl, backupTitle
+        ok: true, mode, pageId: page.id, pageUrl, backupTitle, backupUrl
       }) }] };
     } catch (error) {
       console.error("Error updating page:", error);
