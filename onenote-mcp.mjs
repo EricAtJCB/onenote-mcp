@@ -545,6 +545,7 @@ function readFreshToken() {
 }
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
+let retryUntil = 0; // set per updatePage call; reads are retried until then
 
 async function graphFetch(pathOrUrl, { method = 'GET', headers = {}, body } = {}) {
   const token = readFreshToken();
@@ -552,11 +553,23 @@ async function graphFetch(pathOrUrl, { method = 'GET', headers = {}, body } = {}
     throw new Error('No access token found. Run `npm run auth` in the onenote-mcp folder, then try again.');
   }
   const url = pathOrUrl.startsWith('http') ? pathOrUrl : GRAPH + pathOrUrl;
-  const res = await fetch(url, {
-    method,
-    headers: { Authorization: `Bearer ${token}`, ...headers },
-    body
-  });
+  // OneNote's service sometimes answers 429/502/503/504. Reads are safe to
+  // repeat, so retry them (never writes: a timed-out write may have gone
+  // through). Stop retrying once the current tool call has used its time.
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...headers },
+      body
+    });
+    const transient = [429, 502, 503, 504].includes(res.status);
+    if (!(transient && method === 'GET' && attempt < 2 && Date.now() < retryUntil)) break;
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const waitMs = Math.min(8000, retryAfter > 0 ? retryAfter * 1000 : 2000 * (attempt + 1));
+    console.error(`Graph GET ${res.status}, retrying in ${waitMs} ms (attempt ${attempt + 2} of 3)`);
+    await new Promise(r => setTimeout(r, waitMs));
+  }
   if (res.status === 401) {
     throw new Error('Microsoft rejected the saved sign-in (401, usually an expired token). Run `npm run auth` in the onenote-mcp folder, then try again.');
   }
@@ -593,7 +606,7 @@ function normalizeSectionId(raw) {
 async function findSection(notebook, section, sectionId) {
   if (sectionId) {
     const id = normalizeSectionId(sectionId);
-    const res = await graphFetch(`/me/onenote/sections/${encodeURIComponent(id)}?$expand=parentNotebook`);
+    const res = await graphFetch(`/me/onenote/sections/${encodeURIComponent(id)}`);
     const sec = await res.json();
     if (section && (sec.displayName || '').trim().toLowerCase() !== section.trim().toLowerCase()) {
       throw new Error(`Section ${id} is named "${sec.displayName}", not "${section}".`);
@@ -653,6 +666,7 @@ server.tool(
   },
   async ({ notebook, section, sectionId, title, html, mode, backup }) => {
     try {
+      retryUntil = Date.now() + 60000;
       const sec = await findSection(notebook, section, sectionId);
       const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
