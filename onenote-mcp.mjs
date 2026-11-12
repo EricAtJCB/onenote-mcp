@@ -545,7 +545,19 @@ function readFreshToken() {
 }
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
-let retryUntil = 0; // set per updatePage call; reads are retried until then
+// Time limits, so a slow Microsoft service gives a clear answer instead of a
+// page that hangs. Claude's desktop app gives up on a tool call after ~130 s.
+const REQ_TIMEOUT_MS = Number(process.env.ONENOTE_REQ_TIMEOUT_MS) || 35000;
+const CALL_BUDGET_MS = Number(process.env.ONENOTE_CALL_BUDGET_MS) || 100000;
+let callDeadline = 0;   // set at the start of each updatePage call
+let currentStep = '';   // what the call is doing, for error messages and the log
+
+// Every request is logged here (a file in this folder), because the desktop
+// app does not show this server's console output.
+const LOG_PATH = path.join(__dirname, 'onenote-mcp.log');
+function logLine(text) {
+  try { fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ${text}\n`); } catch (e) { /* ignore */ }
+}
 
 async function graphFetch(pathOrUrl, { method = 'GET', headers = {}, body } = {}) {
   const token = readFreshToken();
@@ -557,17 +569,39 @@ async function graphFetch(pathOrUrl, { method = 'GET', headers = {}, body } = {}
   // repeat, so retry them (never writes: a timed-out write may have gone
   // through). Stop retrying once the current tool call has used its time.
   let res;
+  const shortPath = pathOrUrl.split('?')[0];
   for (let attempt = 0; ; attempt++) {
-    res = await fetch(url, {
-      method,
-      headers: { Authorization: `Bearer ${token}`, ...headers },
-      body
-    });
-    const transient = [429, 502, 503, 504].includes(res.status);
-    if (!(transient && method === 'GET' && attempt < 2 && Date.now() < retryUntil)) break;
-    const retryAfter = Number(res.headers.get('retry-after'));
+    const remaining = callDeadline - Date.now();
+    if (remaining < 2000) {
+      throw new Error(`Ran out of time (${Math.round(CALL_BUDGET_MS / 1000)} s) while ${currentStep || 'talking to Microsoft'}. Microsoft's OneNote service is answering slowly.`);
+    }
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), Math.min(REQ_TIMEOUT_MS, remaining));
+    const t0 = Date.now();
+    let timedOut = false;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, ...headers },
+        body,
+        signal: ctl.signal
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') timedOut = true; else throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    logLine(`${method} ${shortPath} -> ${timedOut ? 'TIMEOUT' : res.status} (${Date.now() - t0} ms) [${currentStep}]`);
+    const transient = timedOut || [429, 502, 503, 504].includes(res.status);
+    if (!(transient && method === 'GET' && attempt < 2 && Date.now() < callDeadline - 5000)) {
+      if (timedOut) {
+        throw new Error(`Microsoft did not answer ${method} ${shortPath} within ${Math.round(Math.min(REQ_TIMEOUT_MS, remaining) / 1000)} s while ${currentStep || 'talking to Microsoft'}.` +
+          (method === 'GET' ? '' : ' This was a write, so it may have gone through. Check OneNote before trying again.'));
+      }
+      break;
+    }
+    const retryAfter = timedOut ? 0 : Number(res.headers.get('retry-after'));
     const waitMs = Math.min(8000, retryAfter > 0 ? retryAfter * 1000 : 2000 * (attempt + 1));
-    console.error(`Graph GET ${res.status}, retrying in ${waitMs} ms (attempt ${attempt + 2} of 3)`);
     await new Promise(r => setTimeout(r, waitMs));
   }
   if (res.status === 401) {
@@ -692,8 +726,11 @@ server.tool(
     backup: z.boolean().default(true).describe("In replace mode, first save a text copy of the old page as a new page in the same section")
   },
   async ({ notebook, section, sectionId, title, html, mode, backup }) => {
+    let backupSaved = null;
+    callDeadline = Date.now() + CALL_BUDGET_MS;
+    logLine(`updatePage start: mode=${mode} section=${sectionId || section} title=${title}`);
     try {
-      retryUntil = Date.now() + 60000;
+      currentStep = 'finding the section';
       const sec = await findSection(notebook, section, sectionId);
       const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
@@ -705,6 +742,7 @@ server.tool(
         }) }] };
       }
 
+      currentStep = 'finding the page';
       const page = await findPageByTitle(sec.id, title);
       const pageUrl = page.links && page.links.oneNoteWebUrl && page.links.oneNoteWebUrl.href;
 
@@ -721,13 +759,17 @@ server.tool(
       // 1. Backup: text copy of the current page (images and ink are not copied).
       let backupTitle = null;
       if (backup) {
+        currentStep = 'reading the old page for the backup';
         const plain = await (await graphFetch(`/me/onenote/pages/${page.id}/content`)).text();
         const oldBody = new JSDOM(plain).window.document.body.innerHTML;
         backupTitle = `${title} (backup ${stamp})`;
+        currentStep = 'saving the backup page';
         await createPageInSection(sec.id, backupTitle, oldBody);
+        backupSaved = backupTitle;
       }
 
       // 2. Find the page's outlines (top-level containers) via generated ids.
+      currentStep = 'reading the page layout';
       const withIds = await (await graphFetch(`/me/onenote/pages/${page.id}/content?includeIDs=true`)).text();
       const doc = new JSDOM(withIds).window.document;
       const outlines = Array.from(doc.body.children).filter(el => el.tagName === 'DIV' && el.id);
@@ -741,18 +783,24 @@ server.tool(
           commands.push({ target: el.id, action: 'replace', content: i === 0 ? `<div>${html}</div>` : '<div></div>' });
         });
       }
+      currentStep = 'replacing the page text';
       await graphFetch(`/me/onenote/pages/${page.id}/content`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(commands)
       });
 
+      logLine(`updatePage done: replaced page ${page.id}, backup=${backupTitle}`);
       return { content: [{ type: "text", text: JSON.stringify({
         ok: true, mode, pageId: page.id, pageUrl, backupTitle
       }) }] };
     } catch (error) {
       console.error("Error updating page:", error);
-      throw new Error(`Failed to update page: ${error.message}`);
+      logLine(`updatePage failed while ${currentStep}: ${error.message}`.slice(0, 600));
+      const note = backupSaved
+        ? ` The backup page "${backupSaved}" was saved. The Master List page ${currentStep === 'replacing the page text' ? 'may or may not have changed, so check it' : 'was not changed'}.`
+        : '';
+      throw new Error(`Failed to update page: ${error.message}${note}`);
     }
   }
 );
