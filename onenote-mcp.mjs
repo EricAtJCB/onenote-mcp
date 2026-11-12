@@ -609,7 +609,7 @@ function describeSections(sections, section) {
   const notebooks = [...new Set(sections.map(nbName))];
   const similar = sections.filter(s => want && (s.displayName || '').toLowerCase().includes(want));
   return `Microsoft returned ${sections.length} sections in ${notebooks.length} notebooks (${notebooks.slice(0, 12).join(', ') || 'none'}). ` +
-    `Sections like "${section}": ${similar.slice(0, 8).map(s => `${nbName(s)} / ${s.displayName} [${s.id}]`).join('; ') || 'none'}.`;
+    `${similar.length ? `Sections like "${section}"` : 'Sections found'}: ${(similar.length ? similar : sections).slice(0, 15).map(s => `${nbName(s)} / ${s.displayName} [${s.id}]`).join('; ') || 'none'}.`;
 }
 
 async function findSection(notebook, section, sectionId) {
@@ -630,13 +630,27 @@ async function findSection(notebook, section, sectionId) {
     }
   }
   if (!section) throw new Error('Pass a section name or a sectionId.');
-  const sections = await graphListAll('/me/onenote/sections?$expand=parentNotebook&$top=100');
+  // Keep the requests small: listing every section of every notebook with
+  // $expand makes Microsoft's OneNote service time out (504) for big accounts.
+  // So find the notebook first, then list only that notebook's sections.
+  let sections;
+  if (notebook) {
+    const wantNb = notebook.trim().toLowerCase();
+    const notebooks = await graphListAll('/me/onenote/notebooks?$select=id,displayName&$top=100');
+    const nbMatches = notebooks.filter(n => (n.displayName || '').trim().toLowerCase() === wantNb);
+    if (nbMatches.length === 0) {
+      throw new Error(`${idNote}No notebook named "${notebook}" was found. Notebooks Microsoft returned (${notebooks.length}): ${notebooks.slice(0, 25).map(n => n.displayName).join('; ') || 'none'}.`);
+    }
+    if (nbMatches.length > 1) {
+      throw new Error(`${nbMatches.length} notebooks are named "${notebook}". Pass a sectionId to pick the section.`);
+    }
+    const secs = await graphListAll(`/me/onenote/notebooks/${encodeURIComponent(nbMatches[0].id)}/sections?$select=id,displayName&$top=100`);
+    sections = secs.map(s => ({ ...s, parentNotebook: { displayName: nbMatches[0].displayName } }));
+  } else {
+    sections = await graphListAll('/me/onenote/sections?$select=id,displayName&$top=100');
+  }
   const wantSection = section.trim().toLowerCase();
-  const wantNotebook = notebook ? notebook.trim().toLowerCase() : null;
-  const matches = sections.filter(s =>
-    (s.displayName || '').trim().toLowerCase() === wantSection &&
-    (!wantNotebook || ((s.parentNotebook && s.parentNotebook.displayName) || '').trim().toLowerCase() === wantNotebook)
-  );
+  const matches = sections.filter(s => (s.displayName || '').trim().toLowerCase() === wantSection);
   if (matches.length === 0) {
     throw new Error(`${idNote}No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found. ${describeSections(sections, section)}`);
   }
