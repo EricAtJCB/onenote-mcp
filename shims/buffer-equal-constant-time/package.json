@@ -1,0 +1,7 @@
+{
+  "name": "buffer-equal-constant-time",
+  "version": "1.0.1",
+  "description": "Local replacement for buffer-equal-constant-time, which crashes on Node 25+ (SlowBuffer was removed). Same function, built on crypto.timingSafeEqual.",
+  "main": "index.js",
+  "license": "BSD-3-Clause"
+}

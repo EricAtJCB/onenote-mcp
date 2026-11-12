@@ -17,6 +17,7 @@
     "@azure/msal-node": "^3.5.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "buffer-equal-constant-time": "file:./shims/buffer-equal-constant-time",
     "dotenv": "^16.0.0",
     "jsdom": "^26.0.0",
     "node-fetch": "^3.3.2",
