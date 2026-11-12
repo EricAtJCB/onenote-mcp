@@ -784,11 +784,52 @@ server.tool(
         });
       }
       currentStep = 'replacing the page text';
-      await graphFetch(`/me/onenote/pages/${page.id}/content`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(commands)
-      });
+      try {
+        await graphFetch(`/me/onenote/pages/${page.id}/content`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(commands)
+        });
+      } catch (e) {
+        // Microsoft's gateway often answers 5xx or times out on page edits even
+        // when the edit went through. Only that kind of failure is checked.
+        if (!/failed \(5\d\d\)|did not answer/.test(e.message)) throw e;
+        logLine(`PATCH did not complete (${e.message.slice(0, 120)}); checking the page`);
+
+        currentStep = 'checking whether the replace went through';
+        await new Promise(r => setTimeout(r, 3000));
+        const marker = new JSDOM(`<body>${html}</body>`).window.document.body.textContent.replace(/\s+/g, ' ').trim().slice(0, 50);
+        let applied = null; // true / false / null = could not tell
+        try {
+          const nowText = await (await graphFetch(`/me/onenote/pages/${page.id}/content`)).text();
+          const nowPlain = new JSDOM(nowText).window.document.body.textContent.replace(/\s+/g, ' ');
+          applied = marker.length > 0 && nowPlain.includes(marker);
+        } catch (e2) {
+          logLine(`could not re-read the page: ${e2.message.slice(0, 160)}`);
+        }
+
+        if (applied) {
+          logLine('PATCH timed out but the new text is on the page');
+          return { content: [{ type: "text", text: JSON.stringify({
+            ok: true, mode, pageId: page.id, pageUrl, backupTitle,
+            note: 'Microsoft timed out, but the new list is on the Master List page.'
+          }) }] };
+        }
+
+        // Not applied (or unknown): add a new page with the list, which does not
+        // touch the original page.
+        currentStep = 'creating a new page instead';
+        const created = await createPageInSection(sec.id, `${title} (prioritized ${stamp.slice(0, 10)})`, html);
+        logLine(`created fallback page ${created.id}`);
+        return { content: [{ type: "text", text: JSON.stringify({
+          ok: true, mode: 'new', fallback: true, pageId: created.id,
+          pageUrl: (created.links && created.links.oneNoteWebUrl && created.links.oneNoteWebUrl.href) || pageUrl,
+          backupTitle,
+          note: applied === false
+            ? `Microsoft would not replace the Master List page (it timed out), so the list was saved as a new page "${title} (prioritized ${stamp.slice(0, 10)})" and the original page is unchanged.`
+            : `Microsoft timed out replacing the Master List page and I could not check it, so the list was also saved as a new page "${title} (prioritized ${stamp.slice(0, 10)})". Check whether Master List changed.`
+        }) }] };
+      }
 
       logLine(`updatePage done: replaced page ${page.id}, backup=${backupTitle}`);
       return { content: [{ type: "text", text: JSON.stringify({
