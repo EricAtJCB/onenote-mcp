@@ -603,15 +603,31 @@ function normalizeSectionId(raw) {
   return m ? `1-${m[0].toLowerCase()}` : String(raw).trim();
 }
 
+function describeSections(sections, section) {
+  const want = (section || '').trim().toLowerCase();
+  const nbName = s => (s.parentNotebook && s.parentNotebook.displayName) || '?';
+  const notebooks = [...new Set(sections.map(nbName))];
+  const similar = sections.filter(s => want && (s.displayName || '').toLowerCase().includes(want));
+  return `Microsoft returned ${sections.length} sections in ${notebooks.length} notebooks (${notebooks.slice(0, 12).join(', ') || 'none'}). ` +
+    `Sections like "${section}": ${similar.slice(0, 8).map(s => `${nbName(s)} / ${s.displayName} [${s.id}]`).join('; ') || 'none'}.`;
+}
+
 async function findSection(notebook, section, sectionId) {
+  let idNote = '';
   if (sectionId) {
     const id = normalizeSectionId(sectionId);
-    const res = await graphFetch(`/me/onenote/sections/${encodeURIComponent(id)}`);
-    const sec = await res.json();
-    if (section && (sec.displayName || '').trim().toLowerCase() !== section.trim().toLowerCase()) {
-      throw new Error(`Section ${id} is named "${sec.displayName}", not "${section}".`);
+    try {
+      const res = await graphFetch(`/me/onenote/sections/${encodeURIComponent(id)}`);
+      const sec = await res.json();
+      if (section && (sec.displayName || '').trim().toLowerCase() !== section.trim().toLowerCase()) {
+        throw new Error(`Section ${id} is named "${sec.displayName}", not "${section}".`);
+      }
+      return sec;
+    } catch (e) {
+      // Only a 404 with a section name to fall back on is worth a second try.
+      if (!section || !/\(404\)/.test(e.message)) throw e;
+      idNote = `The section id ${id} was not found (404), so I searched by name instead. `;
     }
-    return sec;
   }
   if (!section) throw new Error('Pass a section name or a sectionId.');
   const sections = await graphListAll('/me/onenote/sections?$expand=parentNotebook&$top=100');
@@ -622,10 +638,7 @@ async function findSection(notebook, section, sectionId) {
     (!wantNotebook || ((s.parentNotebook && s.parentNotebook.displayName) || '').trim().toLowerCase() === wantNotebook)
   );
   if (matches.length === 0) {
-    const seen = sections.slice(0, 25)
-      .map(s => `${(s.parentNotebook && s.parentNotebook.displayName) || '?'} / ${s.displayName}`)
-      .join('; ');
-    throw new Error(`No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found. Sections Microsoft returned (${sections.length}): ${seen || 'none'}.`);
+    throw new Error(`${idNote}No section named "${section}"${notebook ? ` in notebook "${notebook}"` : ''} was found. ${describeSections(sections, section)}`);
   }
   if (matches.length > 1) {
     throw new Error(`More than one section named "${section}" matched. Pass a notebook name to pick one.`);
